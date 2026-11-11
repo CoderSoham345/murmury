@@ -1,12 +1,3 @@
-import sys
-from unittest.mock import MagicMock
-
-# Mock non-UI dependencies before importing copilot.app
-sys.modules["anthropic"] = MagicMock()
-sys.modules["anthropic.lib"] = MagicMock()
-sys.modules["anthropic.lib.streaming"] = MagicMock()
-sys.modules["numpy"] = MagicMock()
-
 import pytest
 from PySide6.QtCore import QPoint, QSettings
 from PySide6.QtWidgets import QApplication
