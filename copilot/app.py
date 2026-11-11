@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 
+ fix/remember-window-position
 from PySide6.QtCore import QObject, QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
@@ -30,6 +31,15 @@ from PySide6.QtWidgets import (
 )
 
 from . import material, providers, theme
+
+from PySide6.QtCore import QObject, QPoint, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFont, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenuBar, QPushButton,
+                               QScrollArea, QSizeGrip, QVBoxLayout, QWidget)
+
+from . import material
+from . import providers
+ main
 from .answer import PreparedCopilot
 from .chrome import AppearanceButton, TrafficLights
 from .listen import StreamingTranscriber
@@ -103,6 +113,7 @@ def answer_html(text: str) -> str:
         # the one number of the line stands out, so the eye finds it first. quote=False: an apostrophe
         # escaped as &#x27; would put digits inside the text, and the number below would match them
         rest = html.escape(rest, quote=False)
+ fix/remember-window-position
         rest = re.sub(
             r"([€\$£]?\d[\d.,]*\s?(?:%|x|x|m|bn|k|million|billion)?)",
             rf'<b style="color:{c["text"]};">\1</b>',
@@ -117,6 +128,12 @@ def answer_html(text: str) -> str:
             if ref
             else ""
         )
+
+        rest = re.sub(r"([€$£]?\d[\d.,]*\s?(?:%|×|(?:x|m|bn|k|million|billion)\b)?)", rf'<b style="color:{c["text"]};">\1</b>', rest, count=1)
+        body = (f'<b style="color:{c["text"]};">{html.escape(label.group(1), quote=False)}:</b> ' if label else "") + rest
+        tag = (f' <span style="color:{c['tag_fg']}; background:{c['tag_bg']}; font-size:11px;">&nbsp;{html.escape(ref.group(1), quote=False)}&nbsp;</span>'
+               if ref else "")
+ main
         items.append((body, tag))
 
     if FORMAT == "script":
@@ -235,6 +252,7 @@ class Window(QWidget):
         self.input.returnPressed.connect(self.ask_typed)
 
         keys = QHBoxLayout()
+ fix/remember-window-position
         keys.addWidget(QLabel("⌥Space ask   ⌥K clear scroll for earlier answers", objectName="keys"), 1)
         keys.addWidget(
             QSizeGrip(panel),
@@ -242,6 +260,14 @@ class Window(QWidget):
             Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight,
         )
 
+
+        keys.addWidget(QLabel("⌥Space ask · ⌥K clear · scroll for earlier answers", objectName="keys"), 1)
+        copy_all = QPushButton("Copy all")
+        copy_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_all.clicked.connect(self.copy_all)
+        keys.addWidget(copy_all)
+        keys.addWidget(QSizeGrip(panel), 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
+ main
         box.addWidget(self.heard)
         box.addWidget(self.scroll, 1)
         box.addWidget(self.input)
@@ -377,6 +403,30 @@ class Window(QWidget):
             QApplication.clipboard().setText(f"{question}\n{shown}".strip())
             self.cards[card][3].setText(self.cards[card][3].text().split("   copied")[0] + "   copied")
 
+    def copy_all(self) -> None:
+        """Copy every card, oldest first, as Markdown: question as heading, answer lines as bullets."""
+        if not self.cards:
+            return
+        parts = []
+        for card in sorted(self.cards):
+            question = self.cards[card][1].text().strip()
+            lines = card_lines(self.plain.get(card, ""))
+            if not question and not lines:
+                continue
+            md = f"## {question}" if question else ""
+            bullets = "\n".join(f"- {line[4:].strip() if line.upper().startswith('SAY:') else line.lstrip('-•* ').strip()}"
+                                for line in lines)
+            if md and bullets:
+                parts.append(f"{md}\n\n{bullets}")
+            elif md:
+                parts.append(md)
+            elif bullets:
+                parts.append(bullets)
+        text = "\n\n".join(parts).strip()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.bar.setText("Copied all")
+
     def on_meta(self, card: int, text: str) -> None:
         if card in self.cards:
             self.cards[card][3].setText(text)
@@ -443,7 +493,11 @@ def run_answer(
 def start(copilot_ready: threading.Event, holder: dict, bridge: Bridge, args) -> None:
     bridge.status.emit("Loading documents...")
     text = material.as_prompt(material.load([Path(p) for p in args.docs]))
-    service = providers.provider(args.provider)
+    try:
+        service = providers.with_address(providers.provider(args.provider), args.address)
+    except ValueError as error:  # an address that is not http:// or https://
+        bridge.status.emit(str(error))
+        return
     try:
         if service.id == "anthropic":
             copilot = PreparedCopilot(text, situation=args.situation, model=args.model, style=args.style)
@@ -532,11 +586,19 @@ def main(argv: list[str] | None = None) -> None:
         help="the AI service whose API key answers (default: as on the setup screen)",
     )
     parser.add_argument("--model", default=None, help="answer model (default: as on the setup screen)")
+fix/remember-window-position
     parser.add_argument(
         "--show-in-screenshots",
         action="store_true",
         help="testing only: let screenshots and screen sharing see the window",
     )
+
+    parser.add_argument("--address", default=None,
+                        help="Ollama or LM Studio on another computer, e.g. http://mac-mini.local:11434 "
+                             "(default: as on the setup screen, else this Mac)")
+    parser.add_argument("--show-in-screenshots", action="store_true",
+                        help="testing only: let screenshots and screen sharing see the window")
+ main
     args = parser.parse_args(argv)
 
     import os
@@ -548,7 +610,14 @@ def main(argv: list[str] | None = None) -> None:
     app = QApplication(sys.argv)
     app.setFont(QFont(".AppleSystemUIFont", 13))
     theme.apply_saved()
+ fix/remember-window-position
 
+
+    from .setup import REPO_URL
+    menu_bar = QMenuBar()  # no parent: the Mac menu bar, there whenever Murmury is in front
+    star = menu_bar.addMenu("Help").addAction("Star Murmury on GitHub")
+    star.triggered.connect(lambda: QDesktopServices.openUrl(QUrl(REPO_URL)))
+ main
     if not args.docs:
         from .setup import SetupDialog
 
@@ -559,6 +628,7 @@ def main(argv: list[str] | None = None) -> None:
         args.docs, args.situation, args.vocabulary = config.docs, config.situation, config.vocabulary
         args.prepare, args.model, args.style = config.prepare, config.model, config.style
         args.provider = config.provider
+        args.address = config.address
     else:
         from .setup import default_provider, load_style, settings_store
 
@@ -566,6 +636,9 @@ def main(argv: list[str] | None = None) -> None:
         args.provider = args.provider or default_provider()
         args.model = args.model or settings_store().value(f"model_{args.provider}") or "claude-sonnet-5-5"
 
+
+        args.address = args.address or settings_store().value(f"address_{args.provider}") or ""
+ main
     global MAX_LINES, FORMAT
     MAX_LINES = args.style.lines
     FORMAT = args.style.format
