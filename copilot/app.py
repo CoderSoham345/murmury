@@ -1,10 +1,9 @@
 """The floating window: always on top, movable and resizable, hidden from screen sharing.
 
-    uv run python -m copilot.app --docs plan.pdf model.xlsx --situation "a seed pitch to an investor"
+uv run python -m copilot.app --docs plan.pdf model.xlsx --situation "a seed pitch to an investor"
 
 Without --docs, a file dialog asks for the documents. Nothing is saved.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -15,19 +14,28 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPoint, Qt, Signal
+from PySide6.QtCore import QObject, QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-                               QScrollArea, QSizeGrip, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QScrollArea,
+    QSizeGrip,
+    QVBoxLayout,
+    QWidget,
+)
 
-from . import material
-from . import providers
+from . import material, providers, theme
 from .answer import PreparedCopilot
-from .openai_copilot import OpenAICopilot
-from .listen import StreamingTranscriber
-from . import theme
 from .chrome import AppearanceButton, TrafficLights
+from .listen import StreamingTranscriber
+from .openai_copilot import OpenAICopilot
 from .pipeline import respond
+from .setup import settings_store
 
 JOIN_SECONDS = 6.0  # a line this soon after the last one continues the same question
 
@@ -50,7 +58,6 @@ QPushButton:hover { color: $link; }
 
 REF = re.compile(r"\[([^\]]{1,60})\]\s*$")
 
-
 MAX_LINES = 3  # fact lines a card shows under the SAY line: the answer style's limit, set at start
 ANSWERED = threading.Event()  # set once a card is shown: the next setup screen may then ask for a star
 FORMAT = "talking"  # the answer style's format: "script" lines show as one paragraph, the others as bullets
@@ -58,11 +65,13 @@ FORMAT = "talking"  # the answer style's format: "script" lines show as one para
 
 def card_lines(text: str) -> list[str]:
     """The lines a card shows: the SAY line and at most MAX_LINES facts.
-    Closing remarks and stray text are dropped. Copy uses the same lines."""
+
+    Closing remarks and stray text are dropped. Copy uses the same lines.
+    """
     lines, say, facts = [], False, 0
     for line in text.splitlines():
         line = line.strip()
-        if not line or not (line.upper().startswith("SAY:") or line[0] in "-•*"):
+        if not line or not (line.upper().startswith("SAY:") or line[0] in ("-", "•", "*")):
             continue
         if line.upper().startswith("SAY:"):
             if say:
@@ -82,26 +91,40 @@ def answer_html(text: str) -> str:
     head, items = "", []
     for line in card_lines(text):
         if line.upper().startswith("SAY:"):
-            head = f'<p style="font-size:15px; font-weight:600; color:{c['text']}; margin:0 0 6px 0;">{html.escape(line[4:].strip(), quote=False)}</p>'
+            head = f'<p style="font-size:15px; font-weight:600; color:{c["text"]}; margin:0 0 6px 0;">{html.escape(line[4:].strip(), quote=False)}</p>'
             continue
         line = line.lstrip("-•* ").strip()
         ref = REF.search(line)
         body = html.escape(line[: ref.start()].strip() if ref else line)
         plain = html.unescape(body)
-        label = re.match(r"^([A-Za-z0-9][\w /&'’-]{0,40}):\s", plain)
-        rest = plain[label.end():] if label else plain
+        label = re.match(r"^([A-Za-z0-9][\w/&-]{0,40}):\s", plain)
+        rest = plain[label.end() :] if label else plain
+
         # the one number of the line stands out, so the eye finds it first. quote=False: an apostrophe
         # escaped as &#x27; would put digits inside the text, and the number below would match them
         rest = html.escape(rest, quote=False)
-        rest = re.sub(r"([€$£]?\d[\d.,]*\s?(?:%|×|x|m|bn|k|million|billion)?)", rf'<b style="color:{c["text"]};">\1</b>', rest, count=1)
-        body = (f'<b style="color:{c["text"]};">{html.escape(label.group(1), quote=False)}:</b> ' if label else "") + rest
-        tag = (f' <span style="color:{c['tag_fg']}; background:{c['tag_bg']}; font-size:11px;">&nbsp;{html.escape(ref.group(1), quote=False)}&nbsp;</span>'
-               if ref else "")
+        rest = re.sub(
+            r"([€\$£]?\d[\d.,]*\s?(?:%|x|x|m|bn|k|million|billion)?)",
+            rf'<b style="color:{c["text"]};">\1</b>',
+            rest,
+            count=1,
+        )
+        body = (
+            f'<b style="color:{c["text"]};">{html.escape(label.group(1), quote=False)}:</b> ' if label else ""
+        ) + rest
+        tag = (
+            f' <span style="color:{c["tag_fg"]}; background:{c["tag_bg"]}; font-size:11px;">&nbsp;{html.escape(ref.group(1), quote=False)}&nbsp;</span>'
+            if ref
+            else ""
+        )
         items.append((body, tag))
-    if FORMAT == "script":  # one paragraph, read on from the SAY line
+
+    if FORMAT == "script":
+        # one paragraph, read on from the SAY line
         text = " ".join(f"{body}{'' if body.rstrip().endswith(('.', '!', '?')) else '.'}{tag}" for body, tag in items)
-        return head + (f'<p style="margin:0; color:{c['text']}; line-height:140%;">{text}</p>' if items else "")
-    rows = "".join(f'<li style="margin-bottom:4px; color:{c['text']};">{body}{tag}</li>' for body, tag in items)
+        return head + (f'<p style="margin:0; color:{c["text"]}; line-height:140%;">{text}</p>' if items else "")
+
+    rows = "".join(f'<li style="margin-bottom:4px; color:{c["text"]};">{body}{tag}</li>' for body, tag in items)
     return head + (f'<ul style="margin-left:-20px; margin-top:0;">{rows}</ul>' if items else "")
 
 
@@ -109,6 +132,7 @@ def force_light_appearance() -> None:
     """Murmury is designed light; native controls would turn dark in Dark Mode on its white panels."""
     try:
         from AppKit import NSAppearance, NSApplication
+
         NSApplication.sharedApplication().setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameAqua"))
     except Exception:
         pass
@@ -116,18 +140,25 @@ def force_light_appearance() -> None:
 
 def configure_native_window(widget: QWidget, hide_from_capture: bool = True) -> bool:
     """Keep the window visible when another app is in front, on every Space and over full-screen apps,
-    and (unless testing) out of screen sharing and screenshots. Returns whether it is hidden from capture."""
+
+    and (unless testing) out of screen sharing and screenshots. Returns whether it is hidden from capture.
+    """
     try:
         import objc
-        from AppKit import (NSFloatingWindowLevel, NSWindowCollectionBehaviorCanJoinAllSpaces,
-                            NSWindowCollectionBehaviorFullScreenAuxiliary, NSWindowSharingNone,
-                            NSWindowSharingReadOnly)
+        from AppKit import (
+            NSFloatingWindowLevel,
+            NSWindowCollectionBehaviorCanJoinAllSpaces,
+            NSWindowCollectionBehaviorFullScreenAuxiliary,
+            NSWindowSharingNone,
+            NSWindowSharingReadOnly,
+        )
 
         window = objc.objc_object(c_void_p=int(widget.winId())).window()
         window.setHidesOnDeactivate_(False)  # a Qt tool window is a panel, which macOS hides on app switch
         window.setLevel_(NSFloatingWindowLevel)
-        window.setCollectionBehavior_(NSWindowCollectionBehaviorCanJoinAllSpaces
-                                      | NSWindowCollectionBehaviorFullScreenAuxiliary)
+        window.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
         window.setSharingType_(NSWindowSharingNone if hide_from_capture else NSWindowSharingReadOnly)
         return window.sharingType() == NSWindowSharingNone
     except Exception:
@@ -145,8 +176,12 @@ class Bridge(QObject):
 
 class Window(QWidget):
     def __init__(self, bridge: Bridge, ask):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
-                         | Qt.WindowType.Tool)
+        super().__init__(
+            None,
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool,
+        )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Murmury")
         self.resize(430, 330)
@@ -157,6 +192,7 @@ class Window(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(panel)
+
         box = QVBoxLayout(panel)
         box.setContentsMargins(14, 10, 14, 8)
         box.setSpacing(8)
@@ -168,31 +204,44 @@ class Window(QWidget):
         lights.minimize_clicked.connect(self.toggle_compact)
         lights.zoom_clicked.connect(self.toggle_zoom)
         top.addWidget(lights)
-        self.bar = QLabel("Starting…", objectName="bar")
+
+        self.bar = QLabel("Starting...", objectName="bar")
         top.addWidget(self.bar, 1)
+
         top.addWidget(AppearanceButton())
         box.addLayout(top)
+
         self.compact, self.zoomed, self.normal_size = False, False, None
 
         self.heard = QLabel("", objectName="heard", wordWrap=True)
         self.heard.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
         self.cards: dict[int, tuple[QFrame, QLabel, QLabel, QLabel]] = {}
         self.plain: dict[int, str] = {}  # each card's answer as text, for Copy
+
         holder = QWidget(objectName="cards")
         self.stack = QVBoxLayout(holder)
         self.stack.setContentsMargins(0, 0, 4, 0)
         self.stack.setSpacing(8)
         self.stack.addStretch(1)
+
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setWidget(holder)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
         self.input = QLineEdit(placeholderText="Type a question and press Enter")
         self.input.hide()
         self.input.returnPressed.connect(self.ask_typed)
+
         keys = QHBoxLayout()
-        keys.addWidget(QLabel("⌥Space ask · ⌥K clear · scroll for earlier answers", objectName="keys"), 1)
-        keys.addWidget(QSizeGrip(panel), 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
+        keys.addWidget(QLabel("⌥Space ask   ⌥K clear scroll for earlier answers", objectName="keys"), 1)
+        keys.addWidget(
+            QSizeGrip(panel),
+            0,
+            Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight,
+        )
+
         box.addWidget(self.heard)
         box.addWidget(self.scroll, 1)
         box.addWidget(self.input)
@@ -200,6 +249,7 @@ class Window(QWidget):
         self.keys.setLayout(keys)
         keys.setContentsMargins(0, 0, 0, 0)
         box.addWidget(self.keys)
+
         self.apply_theme()
         theme.watch(self.apply_theme)
 
@@ -212,6 +262,23 @@ class Window(QWidget):
         bridge.answer.connect(self.on_answer)
         bridge.meta.connect(self.on_meta)
         bridge.timing.connect(lambda t: self.bar.setText(t))
+
+        self.restore_window_position()
+
+    def save_window_position(self) -> None:
+        settings = settings_store()
+        settings.setValue("window_geometry", self.saveGeometry())
+
+    def restore_window_position(self) -> None:
+        settings = settings_store()
+        geom = settings.value("window_geometry")
+        if geom:
+            self.restoreGeometry(geom)
+        else:
+            screen = QApplication.primaryScreen()
+            if screen:
+                top_right = screen.availableGeometry().topRight()
+                self.move(top_right - QPoint(470, -40))
 
     def toggle_compact(self) -> None:
         """Yellow: fold to the status bar only (a floating panel cannot go to the Dock); again to unfold."""
@@ -255,7 +322,8 @@ class Window(QWidget):
     def apply_theme(self) -> None:
         self.setStyleSheet(theme.fill(STYLE))
         theme.refresh_native(self)
-        for card, (_, _, label, _) in getattr(self, "cards", {}).items():  # answers carry inline colours
+        for card, (_, _, label, _) in getattr(self, "cards", {}).items():
+            # answers carry inline colours
             if self.plain.get(card):
                 label.setText(answer_html(self.plain[card]))
 
@@ -265,26 +333,35 @@ class Window(QWidget):
             inner = QVBoxLayout(frame)
             inner.setContentsMargins(10, 8, 10, 8)
             inner.setSpacing(4)
-            q, a, meta = (QLabel("", objectName="cardq", wordWrap=True), QLabel("", objectName="carda", wordWrap=True),
-                          QLabel("", objectName="cardmeta"))
+
+            q, a, meta = (
+                QLabel("", objectName="cardq", wordWrap=True),
+                QLabel("", objectName="carda", wordWrap=True),
+                QLabel("", objectName="cardmeta"),
+            )
             a.setTextFormat(Qt.TextFormat.RichText)
             for label in (q, a):  # text can be selected and copied
                 label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
             copy = QPushButton("Copy")
             copy.setCursor(Qt.CursorShape.PointingHandCursor)
-            copy.clicked.connect(lambda _=False, c=card: self.copy_card(c))
+            copy.clicked.connect(lambda _, c=card: self.copy_card(c))
+
             footer = QHBoxLayout()
             footer.addWidget(meta, 1)
             footer.addWidget(copy)
+
             inner.addWidget(q)
             inner.addSpacing(4)  # the question, quiet; then the answer, which is what the eye looks for
             inner.addWidget(a)
             inner.addLayout(footer)
+
             self.stack.insertWidget(0, frame)  # newest on top
             self.cards[card] = (frame, q, a, meta)
             for old in sorted(self.cards)[: max(0, len(self.cards) - self.MAX_CARDS)]:
                 self.cards.pop(old)[0].deleteLater()
-            self.scroll.verticalScrollBar().setValue(0)
+
+        self.scroll.verticalScrollBar().setValue(0)
         self.cards[card][1].setText(question)
         self.cards[card][2].setText("")
 
@@ -298,7 +375,7 @@ class Window(QWidget):
             question = self.cards[card][1].text()
             shown = "\n".join(card_lines(self.plain.get(card, "")))
             QApplication.clipboard().setText(f"{question}\n{shown}".strip())
-            self.cards[card][3].setText(self.cards[card][3].text().split(" · copied")[0] + " · copied")
+            self.cards[card][3].setText(self.cards[card][3].text().split("   copied")[0] + "   copied")
 
     def on_meta(self, card: int, text: str) -> None:
         if card in self.cards:
@@ -319,7 +396,7 @@ class Window(QWidget):
 
     def clear(self) -> None:
         self.heard.setText("")
-        for frame, *_ in self.cards.values():
+        for frame, _, _, _ in self.cards.values():
             frame.deleteLater()
         self.cards.clear()
 
@@ -333,8 +410,12 @@ def new_card() -> int:
     return CARDS["next"]
 
 
-def run_answer(copilot: PreparedCopilot, bridge: Bridge, card: int, line: str, before: str, heard_at: float) -> None:
-    run = RUNS[card] = RUNS.get(card, 0) + 1
+def run_answer(
+    copilot: PreparedCopilot, bridge: Bridge, card: int, line: str, before: str, heard_at: float
+) -> None:
+    RUNS[card] = RUNS.get(card, 0) + 1
+    run = RUNS[card]
+
     live = ""
     first = None
     for show in respond(copilot, line, before):
@@ -354,12 +435,13 @@ def run_answer(copilot: PreparedCopilot, bridge: Bridge, card: int, line: str, b
         elif show.kind == "live-done":
             bridge.answer.emit(card, show.text)
             copilot.remember(line, show.text)
-            bridge.meta.emit(card, f"{time.strftime('%H:%M')} · first text {first:.2f}s after transcript")
-            bridge.timing.emit("Listening · nothing saved")
+
+    bridge.meta.emit(card, f"{time.strftime('%H:%M')}   [{first:.2f}s after transcript]")
+    bridge.timing.emit("Listening   nothing saved")
 
 
 def start(copilot_ready: threading.Event, holder: dict, bridge: Bridge, args) -> None:
-    bridge.status.emit("Loading documents…")
+    bridge.status.emit("Loading documents...")
     text = material.as_prompt(material.load([Path(p) for p in args.docs]))
     service = providers.provider(args.provider)
     try:
@@ -373,63 +455,88 @@ def start(copilot_ready: threading.Event, holder: dict, bridge: Bridge, args) ->
     except Exception as error:
         bridge.status.emit(f"Could not reach the model: {str(error)[:120]}")
         return
-    bridge.status.emit("Caching documents…" if service.id == "anthropic" else f"Connecting to {args.model}…")
+
+    bridge.status.emit("Caching documents..." if service.id == "anthropic" else f"Connecting to {args.model}...")
     try:
         usage = copilot.warm()
     except Exception as error:  # no key, no network, a model the key cannot use: say it in the window
-        bridge.status.emit(f"Could not reach {service.name.split(' ·')[0]}: {str(error)[:120]}")
+        bridge.status.emit(f"Could not reach {service.name.split(' ')[0]}: {str(error)[:120]}")
         return
+
     if service.id == "anthropic":
         per_million = {"claude-sonnet-5-5": 4.0, "claude-haiku-4-5": 2.0}.get(args.model)  # 1-hour cache write
         cost = f" (${usage.cache_write * per_million / 1e6:.2f})" if per_million else ""
         bridge.status.emit(f"{usage.cache_write + usage.cache_read:,} tokens cached{cost}")
     else:
-        bridge.status.emit(f"Ready · {args.model}")
-        read = usage.input + usage.cache_read
-        # a local server keeps only what fits its context length and cuts the rest without saying so
-        # (measured: 2,051 of ~27,000 tokens at Ollama's default); documents run 2-4 characters a token
-        if not service.key_required and 0 < read < len(copilot.system) / 6:
-            name, card = service.name.split(" ·")[0], new_card()
-            bridge.card.emit(card, f"{name} cut your documents")
-            bridge.answer.emit(card, f"Only the last {read:,} tokens reached the model, so answers will miss most "
-                                     f"of them. Raise the context length in {name} and start again.")
+        bridge.status.emit(f"Ready   {args.model}")
+
+    read = usage.input + usage.cache_read
+    # a local server keeps only what fits its context length and cuts the rest without saying so
+    # (measured: 2,051 of 27,000 tokens at Ollama's default); documents run 2-4 characters a token
+    if not service.key_required and 0 < read < len(copilot.system) / 6:
+        name, card = service.name.split(" ")[0], new_card()
+        bridge.card.emit(card, f"{name} cut your documents")
+        bridge.answer.emit(
+            card,
+            f"Only the last {read:,} tokens reached the model, so answers will miss most of them. "
+            f"Raise the context length in {name} and start again.",
+        )
+
     if args.prepare and isinstance(copilot, PreparedCopilot):
-        bridge.status.emit(f"Preparing answers to {args.prepare} expected questions…")
+        bridge.status.emit(f"Preparing answers to {args.prepare} expected questions...")
         copilot.prepare(copilot.expected_questions(args.prepare))
+
     holder["copilot"] = copilot
     copilot_ready.set()
-    bridge.status.emit("Loading speech model…")
+
+    bridge.status.emit("Loading speech model...")
     before, pending, last_final, card = "", "", 0.0, 0
     listener = StreamingTranscriber("system", vocabulary=args.vocabulary)
-    for event in listener.events(on_ready=lambda: bridge.status.emit("Listening · nothing saved"),
-                                 on_restart=lambda why: bridge.status.emit(f"Reconnecting audio… ({why})")):
+    for event in listener.events(
+        on_ready=lambda: bridge.status.emit("Listening   nothing saved"),
+        on_restart=lambda why: bridge.status.emit(f"Reconnecting audio... ({why})"),
+    ):
         # a pause inside a long question splits it: a line that STARTS within JOIN_SECONDS of the end of the
-        # previous one continues it (measuring end to end split long second halves)
-        joined = (f"{pending} {event.text}".strip() if event.started - last_final < JOIN_SECONDS
-                  else event.text)
+        # previous one continues it (measuring end-to-end split long second halves)
+        joined = f"{pending} {event.text}".strip() if event.started - last_final < JOIN_SECONDS else event.text
         bridge.heard.emit(joined)
+
         if event.kind == "final":
             if joined != event.text and card:
                 line = joined  # same question, continued: same card, answer redone on the whole
             else:
-                line, before, card = event.text, pending or before, new_card()
+                card = new_card()
+                line, before = event.text, pending or before
             pending, last_final = line, event.at
-            threading.Thread(target=run_answer, args=(copilot, bridge, card, line, before, event.at),
-                             daemon=True).start()
+            threading.Thread(
+                target=run_answer, args=(copilot, bridge, card, line, before, event.at), daemon=True
+            ).start()
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Live answers from your documents during a call")
     parser.add_argument("--docs", nargs="*", default=[], help="PDF, Excel or text files")
-    parser.add_argument("--situation", default="a meeting where the user is asked questions",
-                        help='what the call is, e.g. "a seed pitch to an investor"')
-    parser.add_argument("--vocabulary", default="", help="names the transcription should get right, comma separated")
+    parser.add_argument(
+        "--situation",
+        default="a meeting where the user is asked questions",
+        help='what the call is, e.g. "a seed pitch to an investor"',
+    )
+    parser.add_argument(
+        "--vocabulary", default="", help="names the transcription should get right, comma separated"
+    )
     parser.add_argument("--prepare", type=int, default=0, help="prepare answers to N expected questions first")
-    parser.add_argument("--provider", choices=[p.id for p in providers.PROVIDERS], default=None,
-                        help="the AI service whose API key answers (default: as on the setup screen)")
+    parser.add_argument(
+        "--provider",
+        choices=[p.id for p in providers.PROVIDERS],
+        default=None,
+        help="the AI service whose API key answers (default: as on the setup screen)",
+    )
     parser.add_argument("--model", default=None, help="answer model (default: as on the setup screen)")
-    parser.add_argument("--show-in-screenshots", action="store_true",
-                        help="testing only: let screenshots and screen sharing see the window")
+    parser.add_argument(
+        "--show-in-screenshots",
+        action="store_true",
+        help="testing only: let screenshots and screen sharing see the window",
+    )
     args = parser.parse_args(argv)
 
     import os
@@ -437,9 +544,11 @@ def main(argv: list[str] | None = None) -> None:
 
     # keep the display awake while the copilot runs: a sleeping display stops the audio capture
     subprocess.Popen(["caffeinate", "-di", "-w", str(os.getpid())])
+
     app = QApplication(sys.argv)
     app.setFont(QFont(".AppleSystemUIFont", 13))
     theme.apply_saved()
+
     if not args.docs:
         from .setup import SetupDialog
 
@@ -452,9 +561,11 @@ def main(argv: list[str] | None = None) -> None:
         args.provider = config.provider
     else:
         from .setup import default_provider, load_style, settings_store
+
         args.style = load_style()
         args.provider = args.provider or default_provider()
         args.model = args.model or settings_store().value(f"model_{args.provider}") or "claude-sonnet-5-5"
+
     global MAX_LINES, FORMAT
     MAX_LINES = args.style.lines
     FORMAT = args.style.format
@@ -465,28 +576,34 @@ def main(argv: list[str] | None = None) -> None:
 
     def ask(text: str) -> None:
         if ready.is_set():
-            threading.Thread(target=run_answer, args=(holder["copilot"], bridge, new_card(), text, "",
-                                                      time.perf_counter()), daemon=True).start()
+            threading.Thread(
+                target=run_answer,
+                args=(holder["copilot"], bridge, new_card(), text, "", time.perf_counter()),
+                daemon=True,
+            ).start()
 
     window = Window(bridge, ask)
-    window.move(app.primaryScreen().availableGeometry().topRight() - QPoint(470, -40))
     window.show()
+
     import os
 
     if snapshot := os.environ.get("COPILOT_SNAPSHOT"):  # testing: save the window after each answer
-        bridge.timing.connect(lambda _t: window.grab().save(snapshot))
+        bridge.timing.connect(lambda t: window.grab().save(snapshot))
+
     hidden = configure_native_window(window, hide_from_capture=not args.show_in_screenshots)
     if not hidden and not args.show_in_screenshots:
         bridge.status.emit("Warning: this window may be visible when you share your screen")
+
     threading.Thread(target=start, args=(ready, holder, bridge, args), daemon=True).start()
+
     app.aboutToQuit.connect(count_answered_call)
+    app.aboutToQuit.connect(window.save_window_position)
     app.exec()
 
 
 def count_answered_call() -> None:
     """One more call in which Murmury answered something (the setup screen asks for a star after the first)."""
     if ANSWERED.is_set():
-        from .setup import settings_store
         settings = settings_store()
         settings.setValue("answered_calls", int(settings.value("answered_calls", 0) or 0) + 1)
 
