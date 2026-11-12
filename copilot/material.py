@@ -19,17 +19,28 @@ class Source:
     name: str
     kind: str  # "pdf", "xlsx", "docx", "pptx", "text"
     text: str
+    warning: str | None = None
 
 
-def _pdf(path: Path) -> str:
+def _pdf(path: Path) -> tuple[str, str | None]:
     from pypdf import PdfReader
 
+    reader = PdfReader(path)
+    if reader.is_encrypted:
+        try:
+            if not reader.decrypt(""):
+                return "", "password-protected PDF"
+        except Exception:
+            return "", "password-protected PDF"
     pages = []
-    for number, page in enumerate(PdfReader(path).pages, start=1):
+    for number, page in enumerate(reader.pages, start=1):
         text = (page.extract_text() or "").strip()
         if text:
             pages.append(f"[page {number}]\n{text}")
-    return "\n\n".join(pages)
+    extracted = "\n\n".join(pages)
+    if not extracted:
+        return "", "no text found (scanned?)"
+    return extracted, None
 
 
 def _cell(value: object) -> str:
@@ -187,20 +198,52 @@ def _pptx(path: Path) -> str:
         return "\n\n".join(blocks)
 
 
+def _text(path: Path) -> str:
+    """UTF-8 first (a BOM is dropped), then cp1252 for older notes and exports, then latin-1, which
+    maps every byte, so a stray file never stops the whole call."""
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    return path.read_text(encoding="latin-1")
+
+
 def load(paths: list[Path]) -> list[Source]:
     sources = []
     for path in paths:
         suffix = path.suffix.lower()
         if suffix == ".pdf":
-            sources.append(Source(path.name, "pdf", _pdf(path)))
+            kind = "pdf"
         elif suffix in (".xlsx", ".xlsm"):
-            sources.append(Source(path.name, "xlsx", _xlsx(path)))
+            kind = "xlsx"
         elif suffix == ".docx":
-            sources.append(Source(path.name, "docx", _docx(path)))
+            kind = "docx"
         elif suffix == ".pptx":
-            sources.append(Source(path.name, "pptx", _pptx(path)))
+            kind = "pptx"
         else:
-            sources.append(Source(path.name, "text", path.read_text(encoding="utf-8")))
+            kind = "text"
+        try:
+            if kind == "pdf":
+                text, warning = _pdf(path)
+            elif kind == "xlsx":
+                text = _xlsx(path)
+                warning = None
+            elif kind == "docx":
+                text = _docx(path)
+                warning = None
+            elif kind == "pptx":
+                text = _pptx(path)
+                warning = None
+            else:
+                text = _text(path)
+                warning = None
+        except Exception:
+            text = ""
+            warning = f"could not read {kind.upper()}"
+        if not text.strip() and warning is None:
+            warning = "no text found"
+        sources.append(Source(path.name, kind, text, warning))
     return sources
 
 

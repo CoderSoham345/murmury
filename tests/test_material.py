@@ -1,6 +1,8 @@
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
+from pypdf import PdfWriter
+
 from copilot.material import as_prompt, load
 
 
@@ -84,3 +86,104 @@ def test_pptx_uses_declared_slide_order_and_includes_notes(tmp_path):
     assert "99" not in source.text
     assert as_prompt(load([path])) == as_prompt(load([path]))
 
+
+def test_text_file_in_cp1252_loads_without_losing_accents(tmp_path):
+    notes = tmp_path / "notes.txt"
+    notes.write_bytes(b"Caf\xe9 notes\n")
+
+    [source] = load([notes])
+
+    assert source.kind == "text"
+    assert source.text == "Café notes\n"
+
+
+def test_text_file_with_utf8_bom_drops_the_bom(tmp_path):
+    notes = tmp_path / "notes.md"
+    notes.write_bytes("\ufeffCafé notes\n".encode("utf-8"))
+
+    [source] = load([notes])
+
+    assert source.text == "Café notes\n"
+
+
+def test_text_file_with_bytes_undefined_in_cp1252_still_loads(tmp_path):
+    notes = tmp_path / "export.csv"
+    notes.write_bytes(b"id;name\n1;Caf\xe9 \x81\n")
+
+    [source] = load([notes])
+
+    assert source.text.startswith("id;name\n1;Caf")
+    assert "\x81" in source.text  # latin-1 keeps the byte instead of raising
+
+
+def test_pdf_without_extractable_text_produces_warning(tmp_path):
+    path = tmp_path / "scanned.pdf"
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(path)
+
+    [source] = load([path])
+
+    assert source.kind == "pdf"
+    assert source.text == ""
+    assert source.warning == "no text found (scanned?)"
+
+
+def test_password_protected_pdf_produces_warning(tmp_path):
+    path = tmp_path / "protected.pdf"
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.encrypt("test-password")
+    writer.write(path)
+
+    [source] = load([path])
+
+    assert source.kind == "pdf"
+    assert source.text == ""
+    assert source.warning == "password-protected PDF"
+
+
+def test_corrupted_pdf_does_not_stop_other_documents(tmp_path):
+    broken = tmp_path / "broken.pdf"
+    valid = tmp_path / "notes.txt"
+
+    broken.write_bytes(b"This is not a valid PDF")
+    valid.write_text("Valid document content", encoding="utf-8")
+
+    sources = load([broken, valid])
+
+    assert len(sources) == 2
+    assert sources[0].warning == "could not read PDF"
+    assert sources[1].text == "Valid document content"
+    assert sources[1].warning is None
+
+
+def test_broken_docx_does_not_stop_other_documents(tmp_path):
+    broken = tmp_path / "broken.docx"
+    valid = tmp_path / "notes.txt"
+
+    broken.write_bytes(b"This is not a valid DOCX file")
+    valid.write_text("Valid document content", encoding="utf-8")
+
+    sources = load([broken, valid])
+
+    assert len(sources) == 2
+    assert sources[0].kind == "docx"
+    assert sources[0].text == ""
+    assert sources[0].warning == "could not read DOCX"
+    assert sources[1].kind == "text"
+    assert sources[1].text == "Valid document content"
+    assert sources[1].warning is None
+
+
+def test_empty_text_file_produces_warning(tmp_path):
+    path = tmp_path / "empty.txt"
+    path.write_text("", encoding="utf-8")
+
+    [source] = load([path])
+
+    assert source.kind == "text"
+    assert source.text == ""
+    assert source.warning == "no text found"

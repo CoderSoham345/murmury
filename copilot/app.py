@@ -15,9 +15,9 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPoint, Qt, Signal
-from PySide6.QtGui import QFont, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+from PySide6.QtCore import QObject, QPoint, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFont, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenuBar, QPushButton,
                                QScrollArea, QSizeGrip, QVBoxLayout, QWidget)
 
 from . import material
@@ -27,6 +27,7 @@ from .openai_copilot import OpenAICopilot
 from .listen import StreamingTranscriber
 from . import theme
 from .chrome import AppearanceButton, TrafficLights
+from .hotkeys import HotKeyError, HotKeys
 from .pipeline import respond
 
 JOIN_SECONDS = 6.0  # a line this soon after the last one continues the same question
@@ -93,7 +94,7 @@ def answer_html(text: str) -> str:
         # the one number of the line stands out, so the eye finds it first. quote=False: an apostrophe
         # escaped as &#x27; would put digits inside the text, and the number below would match them
         rest = html.escape(rest, quote=False)
-        rest = re.sub(r"([€$£]?\d[\d.,]*\s?(?:%|×|x|m|bn|k|million|billion)?)", rf'<b style="color:{c["text"]};">\1</b>', rest, count=1)
+        rest = re.sub(r"([€$£]?\d[\d.,]*\s?(?:%|×|(?:x|m|bn|k|million|billion)\b)?)", rf'<b style="color:{c["text"]};">\1</b>', rest, count=1)
         body = (f'<b style="color:{c["text"]};">{html.escape(label.group(1), quote=False)}:</b> ' if label else "") + rest
         tag = (f' <span style="color:{c['tag_fg']}; background:{c['tag_bg']}; font-size:11px;">&nbsp;{html.escape(ref.group(1), quote=False)}&nbsp;</span>'
                if ref else "")
@@ -136,11 +137,13 @@ def configure_native_window(widget: QWidget, hide_from_capture: bool = True) -> 
 
 class Bridge(QObject):
     status = Signal(str)
+    warning = Signal(str)
     heard = Signal(str)
     card = Signal(int, str)  # create or update the card for a question
     answer = Signal(int, str)  # the card's answer so far
     meta = Signal(int, str)  # the card's timing line
     timing = Signal(str)  # status bar after an answer
+    hotkey = Signal(str)  # a global hotkey was pressed: "ask" or "clear"
 
 
 class Window(QWidget):
@@ -192,6 +195,10 @@ class Window(QWidget):
         self.input.returnPressed.connect(self.ask_typed)
         keys = QHBoxLayout()
         keys.addWidget(QLabel("⌥Space ask · ⌥K clear · scroll for earlier answers", objectName="keys"), 1)
+        copy_all = QPushButton("Copy all")
+        copy_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_all.clicked.connect(self.copy_all)
+        keys.addWidget(copy_all)
         keys.addWidget(QSizeGrip(panel), 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
         box.addWidget(self.heard)
         box.addWidget(self.scroll, 1)
@@ -203,16 +210,34 @@ class Window(QWidget):
         self.apply_theme()
         theme.watch(self.apply_theme)
 
-        QShortcut(QKeySequence("Alt+Space"), self, self.toggle_input)
-        QShortcut(QKeySequence("Alt+K"), self, self.clear)
+        # in-window shortcuts; main() turns one off once its global hotkey is registered, so a key never fires twice
+        self.shortcuts = {"ask": QShortcut(QKeySequence("Alt+Space"), self, self.toggle_input),
+                          "clear": QShortcut(QKeySequence("Alt+K"), self, self.clear)}
+        bridge.hotkey.connect(self.on_hotkey)
 
-        bridge.status.connect(self.bar.setText)
+        self.warning_text = ""
+        bridge.status.connect(self.set_status)
+        bridge.warning.connect(self.set_warning)
         bridge.heard.connect(lambda t: self.heard.setText(f"them: {t}"))
         bridge.card.connect(self.on_card)
         bridge.answer.connect(self.on_answer)
         bridge.meta.connect(self.on_meta)
+ fix/window-position-clean
         bridge.timing.connect(lambda t: self.bar.setText(t))
         self.restore_window_position()
+
+        bridge.timing.connect(self.set_status)
+
+    def set_warning(self, warning: str) -> None:
+        self.warning_text = warning
+        if warning:
+            self.bar.setText(f"{self.bar.text()} | {warning}")
+
+    def set_status(self, status: str) -> None:
+        if self.warning_text:
+            status = f"{status} | {self.warning_text}"
+        self.bar.setText(status)
+ main
 
     def toggle_compact(self) -> None:
         """Yellow: fold to the status bar only (a floating panel cannot go to the Dock); again to unfold."""
@@ -301,9 +326,43 @@ class Window(QWidget):
             QApplication.clipboard().setText(f"{question}\n{shown}".strip())
             self.cards[card][3].setText(self.cards[card][3].text().split(" · copied")[0] + " · copied")
 
+    def copy_all(self) -> None:
+        """Copy every card, oldest first, as Markdown: question as heading, answer lines as bullets."""
+        if not self.cards:
+            return
+        parts = []
+        for card in sorted(self.cards):
+            question = self.cards[card][1].text().strip()
+            lines = card_lines(self.plain.get(card, ""))
+            if not question and not lines:
+                continue
+            md = f"## {question}" if question else ""
+            bullets = "\n".join(f"- {line[4:].strip() if line.upper().startswith('SAY:') else line.lstrip('-•* ').strip()}"
+                                for line in lines)
+            if md and bullets:
+                parts.append(f"{md}\n\n{bullets}")
+            elif md:
+                parts.append(md)
+            elif bullets:
+                parts.append(bullets)
+        text = "\n\n".join(parts).strip()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.set_status("Copied all")
+
     def on_meta(self, card: int, text: str) -> None:
         if card in self.cards:
             self.cards[card][3].setText(text)
+
+    def on_hotkey(self, name: str) -> None:
+        """A global hotkey, pressed while any app has focus. Runs on the main thread (it arrives as a Qt signal)."""
+        if name == "ask":
+            if not self.input.isVisible():  # opening the box: the typing has to land here, not in the call app
+                bring_to_front()
+                self.raise_()
+            self.toggle_input()
+        elif name == "clear":
+            self.clear()
 
     def toggle_input(self) -> None:
         self.input.setVisible(not self.input.isVisible())
@@ -378,8 +437,26 @@ def run_answer(copilot: PreparedCopilot, bridge: Bridge, card: int, line: str, b
 
 def start(copilot_ready: threading.Event, holder: dict, bridge: Bridge, args) -> None:
     bridge.status.emit("Loading documents…")
-    text = material.as_prompt(material.load([Path(p) for p in args.docs]))
-    service = providers.provider(args.provider)
+    sources = material.load([Path(p) for p in args.docs])
+
+    warnings = [
+        f"{source.name}: {source.warning}"
+        for source in sources
+        if source.warning
+    ]
+
+    if warnings:
+        summary = "; ".join(warnings[:2])
+        if len(warnings) > 2:
+            summary += f"; and {len(warnings) - 2} more"
+        bridge.warning.emit(summary)
+
+    text = material.as_prompt(sources)
+    try:
+        service = providers.with_address(providers.provider(args.provider), args.address)
+    except ValueError as error:  # an address that is not http:// or https://
+        bridge.status.emit(str(error))
+        return
     try:
         if service.id == "anthropic":
             copilot = PreparedCopilot(text, situation=args.situation, model=args.model, style=args.style)
@@ -446,6 +523,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--provider", choices=[p.id for p in providers.PROVIDERS], default=None,
                         help="the AI service whose API key answers (default: as on the setup screen)")
     parser.add_argument("--model", default=None, help="answer model (default: as on the setup screen)")
+    parser.add_argument("--address", default=None,
+                        help="Ollama or LM Studio on another computer, e.g. http://mac-mini.local:11434 "
+                             "(default: as on the setup screen, else this Mac)")
     parser.add_argument("--show-in-screenshots", action="store_true",
                         help="testing only: let screenshots and screen sharing see the window")
     args = parser.parse_args(argv)
@@ -458,6 +538,10 @@ def main(argv: list[str] | None = None) -> None:
     app = QApplication(sys.argv)
     app.setFont(QFont(".AppleSystemUIFont", 13))
     theme.apply_saved()
+    from .setup import REPO_URL
+    menu_bar = QMenuBar()  # no parent: the Mac menu bar, there whenever Murmury is in front
+    star = menu_bar.addMenu("Help").addAction("Star Murmury on GitHub")
+    star.triggered.connect(lambda: QDesktopServices.openUrl(QUrl(REPO_URL)))
     if not args.docs:
         from .setup import SetupDialog
 
@@ -468,11 +552,13 @@ def main(argv: list[str] | None = None) -> None:
         args.docs, args.situation, args.vocabulary = config.docs, config.situation, config.vocabulary
         args.prepare, args.model, args.style = config.prepare, config.model, config.style
         args.provider = config.provider
+        args.address = config.address
     else:
         from .setup import default_provider, load_style, settings_store
         args.style = load_style()
         args.provider = args.provider or default_provider()
         args.model = args.model or settings_store().value(f"model_{args.provider}") or "claude-sonnet-5-5"
+        args.address = args.address or settings_store().value(f"address_{args.provider}") or ""
     global MAX_LINES, FORMAT
     MAX_LINES = args.style.lines
     FORMAT = args.style.format
@@ -495,10 +581,54 @@ def main(argv: list[str] | None = None) -> None:
     hidden = configure_native_window(window, hide_from_capture=not args.show_in_screenshots)
     if not hidden and not args.show_in_screenshots:
         bridge.status.emit("Warning: this window may be visible when you share your screen")
+    hotkeys = register_global_hotkeys(window, bridge)
+    app.aboutToQuit.connect(hotkeys.unregister_all)
     threading.Thread(target=start, args=(ready, holder, bridge, args), daemon=True).start()
     app.aboutToQuit.connect(window.save_window_position)
     app.aboutToQuit.connect(count_answered_call)
     app.exec()
+
+
+def bring_to_front() -> None:
+    """Make Murmury the active app, so typed text goes to it and not to the call app. Tries the calls newest
+    first: each can be missing or deprecated on some macOS versions, and none of them may stop the hotkey."""
+    try:
+        from AppKit import NSApplication, NSApplicationActivateIgnoringOtherApps, NSRunningApplication
+    except Exception:
+        return
+    for attempt in (lambda: NSApplication.sharedApplication().activateIgnoringOtherApps_(True),
+                    lambda: NSRunningApplication.currentApplication().activateWithOptions_(
+                        NSApplicationActivateIgnoringOtherApps)):
+        try:
+            attempt()
+            return
+        except Exception:
+            continue
+
+
+DEFAULT_HOTKEYS = {"ask": "option+space", "clear": "option+k"}
+
+
+def register_global_hotkeys(window: Window, bridge: Bridge) -> HotKeys:
+    """Make Option+Space and Option+K work while another app is in front (the combinations can be changed with the
+    `hotkey_ask` and `hotkey_clear` preferences). One that cannot be registered keeps its in-window shortcut."""
+    from .setup import settings_store
+
+    hotkeys = HotKeys(bridge.hotkey.emit)
+    if not hotkeys.available:
+        return hotkeys
+    settings = settings_store()
+    problems = []
+    for name, default in DEFAULT_HOTKEYS.items():
+        combo = str(settings.value(f"hotkey_{name}", default) or default)
+        try:
+            hotkeys.register(name, combo)
+            window.shortcuts[name].setEnabled(False)
+        except HotKeyError as error:
+            problems.append(str(error))
+    if problems:
+        bridge.status.emit(f"Global shortcut off: {'; '.join(problems)}. It works while Murmury is in front.")
+    return hotkeys
 
 
 def count_answered_call() -> None:
