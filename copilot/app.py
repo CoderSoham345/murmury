@@ -212,6 +212,7 @@ class Window(QWidget):
         bridge.answer.connect(self.on_answer)
         bridge.meta.connect(self.on_meta)
         bridge.timing.connect(lambda t: self.bar.setText(t))
+        self.restore_window_position()
 
     def toggle_compact(self) -> None:
         """Yellow: fold to the status bar only (a floating panel cannot go to the Dock); again to unfold."""
@@ -322,6 +323,23 @@ class Window(QWidget):
         for frame, *_ in self.cards.values():
             frame.deleteLater()
         self.cards.clear()
+
+    def restore_window_position(self) -> None:
+        from .setup import settings_store
+
+        geom = settings_store().value("window_geometry")
+        if geom and self.restoreGeometry(geom):
+            screen = QApplication.screenAt(self.frameGeometry().center())
+            if screen is not None:
+                return
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            self.move(screen.availableGeometry().topRight() - QPoint(470, -40))
+
+    def save_window_position(self) -> None:
+        from .setup import settings_store
+
+        settings_store().setValue("window_geometry", self.saveGeometry())
 
 
 RUNS: dict[int, int] = {}  # card -> newest run; an older run for the same card stops updating it
@@ -469,7 +487,6 @@ def main(argv: list[str] | None = None) -> None:
                                                       time.perf_counter()), daemon=True).start()
 
     window = Window(bridge, ask)
-    window.move(app.primaryScreen().availableGeometry().topRight() - QPoint(470, -40))
     window.show()
     import os
 
@@ -479,6 +496,7 @@ def main(argv: list[str] | None = None) -> None:
     if not hidden and not args.show_in_screenshots:
         bridge.status.emit("Warning: this window may be visible when you share your screen")
     threading.Thread(target=start, args=(ready, holder, bridge, args), daemon=True).start()
+    app.aboutToQuit.connect(window.save_window_position)
     app.aboutToQuit.connect(count_answered_call)
     app.exec()
 
